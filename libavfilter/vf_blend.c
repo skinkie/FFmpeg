@@ -75,6 +75,7 @@ static const AVOption blend_options[] = {
     { "and",        "", 0, AV_OPT_TYPE_CONST, {.i64=BLEND_AND},        0, 0, FLAGS, "mode" },
     { "average",    "", 0, AV_OPT_TYPE_CONST, {.i64=BLEND_AVERAGE},    0, 0, FLAGS, "mode" },
     { "burn",       "", 0, AV_OPT_TYPE_CONST, {.i64=BLEND_BURN},       0, 0, FLAGS, "mode" },
+    { "colorerase", "", 0, AV_OPT_TYPE_CONST, {.i64=BLEND_COLORERASE}, 0, 0, FLAGS, "mode" },
     { "darken",     "", 0, AV_OPT_TYPE_CONST, {.i64=BLEND_DARKEN},     0, 0, FLAGS, "mode" },
     { "difference", "", 0, AV_OPT_TYPE_CONST, {.i64=BLEND_DIFFERENCE}, 0, 0, FLAGS, "mode" },
     { "difference128", "", 0, AV_OPT_TYPE_CONST, {.i64=BLEND_GRAINEXTRACT}, 0, 0, FLAGS, "mode" },
@@ -209,6 +210,78 @@ static void blend_normal_32bit(const uint8_t *_top, ptrdiff_t top_linesize,
         bottom += bottom_linesize;
     }
 }
+
+static void blend_colorerase_8bit(const uint8_t *top, ptrdiff_t top_linesize,
+                                  const uint8_t *bottom, ptrdiff_t bottom_linesize,
+                                  uint8_t *dst, ptrdiff_t dst_linesize,
+                                  ptrdiff_t width, ptrdiff_t height,
+                                  FilterParams *param, double *values, int starty)
+{
+    const float opacity = param->opacity;
+    int i, j;
+
+    for (i = 0; i < height; i++) {
+        for (j = 0; j < width; j++) {
+            if (opacity != 0.0f) {
+            }
+            dst[j] = top[j] * opacity + bottom[j] * (1.f - opacity);
+        }
+        dst    += dst_linesize;
+        top    += top_linesize;
+        bottom += bottom_linesize;
+    }
+}
+
+static void blend_colorerase_16bit(const uint8_t *_top, ptrdiff_t top_linesize,
+                                  const uint8_t *_bottom, ptrdiff_t bottom_linesize,
+                                  uint8_t *_dst, ptrdiff_t dst_linesize,
+                                  ptrdiff_t width, ptrdiff_t height,
+                                  FilterParams *param, double *values, int starty)
+{
+    const uint16_t *top = (uint16_t*)_top;
+    const uint16_t *bottom = (uint16_t*)_bottom;
+    uint16_t *dst = (uint16_t*)_dst;
+    const float opacity = param->opacity;
+    int i, j;
+    dst_linesize /= 2;
+    top_linesize /= 2;
+    bottom_linesize /= 2;
+
+    for (i = 0; i < height; i++) {
+        for (j = 0; j < width; j++) {
+            dst[j] = top[j] * opacity + bottom[j] * (1.f - opacity);
+        }
+        dst    += dst_linesize;
+        top    += top_linesize;
+        bottom += bottom_linesize;
+    }
+}
+
+static void blend_colorerase_32bit(const uint8_t *_top, ptrdiff_t top_linesize,
+                               const uint8_t *_bottom, ptrdiff_t bottom_linesize,
+                               uint8_t *_dst, ptrdiff_t dst_linesize,
+                               ptrdiff_t width, ptrdiff_t height,
+                               FilterParams *param, double *values, int starty)
+{
+    const float *top = (float*)_top;
+    const float *bottom = (float*)_bottom;
+    float *dst = (float*)_dst;
+    const float opacity = param->opacity;
+    int i, j;
+    dst_linesize /= 4;
+    top_linesize /= 4;
+    bottom_linesize /= 4;
+
+    for (i = 0; i < height; i++) {
+        for (j = 0; j < width; j++) {
+            dst[j] = top[j] * opacity + bottom[j] * (1.f - opacity);
+        }
+        dst    += dst_linesize;
+        top    += top_linesize;
+        bottom += bottom_linesize;
+    }
+}
+
 
 #define DEFINE_BLEND8(name, expr)                                              \
 static void blend_## name##_8bit(const uint8_t *top, ptrdiff_t top_linesize,         \
@@ -614,18 +687,70 @@ static AVFrame *blend_frame(AVFilterContext *ctx, AVFrame *top_buf,
         return top_buf;
     av_frame_copy_props(dst_buf, top_buf);
 
-    for (plane = 0; plane < s->nb_planes; plane++) {
-        int hsub = plane == 1 || plane == 2 ? s->hsub : 0;
-        int vsub = plane == 1 || plane == 2 ? s->vsub : 0;
-        int outw = AV_CEIL_RSHIFT(dst_buf->width,  hsub);
-        int outh = AV_CEIL_RSHIFT(dst_buf->height, vsub);
-        FilterParams *param = &s->params[plane];
-        ThreadData td = { .top = top_buf, .bottom = bottom_buf, .dst = dst_buf,
-                          .w = outw, .h = outh, .param = param, .plane = plane,
-                          .inlink = inlink };
+    if (s->all_mode == BLEND_COLORERASE && s->nb_planes == 4) {
+        int i, j;
+		for (i = 0; i < top_buf->height; i++) { /* This is also not sustainable if the sizes do not match */
+			for (j = 0; j < top_buf->width; j++) {
 
-        ff_filter_execute(ctx, filter_slice, &td, NULL,
-                          FFMIN(outh, ff_filter_get_nb_threads(ctx)));
+                uint8_t alpha = 0;
+
+                uint8_t in_alpha = top_buf->data[3][dst_buf->linesize[3] * i + j];
+
+
+                if (in_alpha != 0.0) { /* TODO component opacity */
+                    for (plane = 0; plane < s->nb_planes - 1; plane++) {
+                        /* In Gimp clamped between 0.0 and 1.0 */
+                        uint8_t col = top_buf->data[plane][top_buf->linesize[plane] * i + j];
+                        uint8_t bgcol = bottom_buf->data[plane][bottom_buf->linesize[plane] * i + j];
+                        if (FFABS(col - bgcol) > 0) {
+                            float a;
+                            if (col > bgcol)
+                                a = (255 * (col - bgcol) / (255 - bgcol));
+                            else
+                                a = (255 * (bgcol - col) / bgcol);
+
+                            alpha = FFMAX(alpha, a);
+                        }
+                    }
+
+                    if (alpha > 0) {
+
+                        float alpha_inv = 1.0f / (alpha / 255.0f);
+
+                        for (plane = 0; plane < s->nb_planes - 1; plane++) {
+                            uint8_t col = top_buf->data[plane][top_buf->linesize[plane] * i + j];
+                            uint8_t bgcol = bottom_buf->data[plane][bottom_buf->linesize[plane] * i + j];
+                            uint8_t comp = ((col - bgcol) * alpha_inv) + bgcol;
+                            // Component opacity
+                            // uint8_t ratio = alpha / new_alpha;
+                            dst_buf->data[plane][dst_buf->linesize[plane] * i + j] = comp; // comp * ratio + col * (1 - ratio);
+                        }
+                    } else {
+                        dst_buf->data[0][dst_buf->linesize[0] * i + j] = top_buf->data[0][top_buf->linesize[0] * i + j];
+                        dst_buf->data[1][dst_buf->linesize[1] * i + j] = top_buf->data[1][top_buf->linesize[1] * i + j];
+                        dst_buf->data[2][dst_buf->linesize[2] * i + j] = top_buf->data[2][top_buf->linesize[2] * i + j];
+                    }
+
+                    dst_buf->data[3][dst_buf->linesize[3] * i + j] = alpha;
+                } else {
+                    dst_buf->data[3][dst_buf->linesize[3] * i + j] = 0;
+                }
+            }
+        }
+    } else {
+        for (plane = 0; plane < s->nb_planes; plane++) {
+            int hsub = plane == 1 || plane == 2 ? s->hsub : 0;
+            int vsub = plane == 1 || plane == 2 ? s->vsub : 0;
+            int outw = AV_CEIL_RSHIFT(dst_buf->width,  hsub);
+            int outh = AV_CEIL_RSHIFT(dst_buf->height, vsub);
+            FilterParams *param = &s->params[plane];
+            ThreadData td = { .top = top_buf, .bottom = bottom_buf, .dst = dst_buf,
+                            .w = outw, .h = outh, .param = param, .plane = plane,
+                            .inlink = inlink };
+
+            ff_filter_execute(ctx, filter_slice, &td, NULL,
+                            FFMIN(outh, ff_filter_get_nb_threads(ctx)));
+        }
     }
 
     if (!s->tblend)
@@ -701,6 +826,7 @@ static av_cold void init_blend_func_##depth##_##nbits##bit(FilterParams *param) 
 {                                                                                     \
     switch (param->mode) {                                                            \
     case BLEND_ADDITION:     param->blend = blend_addition_##depth##bit;     break;   \
+    case BLEND_COLORERASE:   param->blend = blend_colorerase_##nbits##bit;   break;   \
     case BLEND_GRAINMERGE:   param->blend = blend_grainmerge_##depth##bit;   break;   \
     case BLEND_AND:          param->blend = blend_and_##depth##bit;          break;   \
     case BLEND_AVERAGE:      param->blend = blend_average_##depth##bit;      break;   \
